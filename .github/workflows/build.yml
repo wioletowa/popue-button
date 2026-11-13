@@ -67,8 +67,8 @@ jobs:
           cp packaging/macos/Info.plist $app/Contents/Info.plist
           mkdir Popue.iconset
           for s in 16 32 128 256 512; do
-            sips -z $s $s assets/closed.png --out Popue.iconset/icon_${s}x${s}.png >/dev/null
-            sips -z $((s*2)) $((s*2)) assets/closed.png --out Popue.iconset/icon_${s}x${s}@2x.png >/dev/null
+            sips -z $s $s assets/icon.png --out Popue.iconset/icon_${s}x${s}.png >/dev/null
+            sips -z $((s*2)) $((s*2)) assets/icon.png --out Popue.iconset/icon_${s}x${s}@2x.png >/dev/null
           done
           iconutil -c icns Popue.iconset -o $app/Contents/Resources/Popue.icns
           codesign --force --deep --sign - $app

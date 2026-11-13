@@ -1,193 +1,256 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::io::Cursor;
-
-use eframe::egui;
-
-const CLOSED_PNG: &[u8] = include_bytes!("../assets/closed.png");
-const OPEN_PNG: &[u8] = include_bytes!("../assets/open.png");
-const SOUND_MP3: &[u8] = include_bytes!("../assets/popue.mp3");
-
-const TITLE: &str = "popue!";
-
-const WINDOW_SIZE: f32 = 400.0;
-/// The button fills this fraction of the window's shorter side.
-const BUTTON_FRACTION: f32 = 0.8;
-const MIN_WINDOW_SIZE: f32 = 200.0;
-
-fn decode_png(bytes: &[u8]) -> image::RgbaImage {
-    image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
-        .expect("embedded PNG is valid")
-        .to_rgba8()
-}
-
-fn to_color_image(img: &image::RgbaImage) -> egui::ColorImage {
-    let size = [img.width() as usize, img.height() as usize];
-    egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())
-}
-
-struct Audio {
-    // Must stay alive for the output device to keep playing.
-    sink: rodio::MixerDeviceSink,
-    player: Option<rodio::Player>,
-}
-
-impl Audio {
-    fn open() -> Option<Self> {
-        match rodio::DeviceSinkBuilder::open_default_sink() {
-            Ok(mut sink) => {
-                sink.log_on_drop(false);
-                Some(Self { sink, player: None })
-            }
-            Err(err) => {
-                eprintln!("audio unavailable: {err}");
-                None
-            }
-        }
+mod assets {
+    pub struct GlyphInfo {
+        pub width: usize,
+        pub height: usize,
+        /// Offset of the mask from the pen position, at `GLYPH_PX`.
+        pub left: f32,
+        /// Offset of the mask's top from the baseline (negative is up).
+        pub top: f32,
+        pub advance: f32,
+        /// Start of this glyph's mask in the glyph blob.
+        pub offset: usize,
     }
 
-    /// Stops the current sound (if any) and plays it again from the start.
-    fn restart(&mut self) {
-        if let Some(player) = self.player.take() {
-            player.stop();
-        }
-        match rodio::play(self.sink.mixer(), Cursor::new(SOUND_MP3)) {
-            Ok(player) => self.player = Some(player),
-            Err(err) => eprintln!("failed to play sound: {err}"),
-        }
+    include!(concat!(env!("OUT_DIR"), "/assets.rs"));
+
+    pub const CLOSED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/closed.bin"));
+    pub const OPEN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/open.bin"));
+    pub const ICON: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon.bin"));
+    pub const GLYPH_MASKS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/glyphs.bin"));
+    pub const SOUND: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sound.bin"));
+}
+
+mod audio;
+mod render;
+
+use std::num::NonZeroU32;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::event::{ElementState, MouseButton, StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{CursorIcon, Icon, Window, WindowId};
+
+use render::{Image, Layout, Scene};
+
+const WINDOW_SIZE: f64 = 400.0;
+const MIN_WINDOW_SIZE: f64 = 200.0;
+const FRAME: Duration = Duration::from_millis(16);
+
+fn inflate(data: &[u8]) -> Vec<u8> {
+    miniz_oxide::inflate::decompress_to_vec(data).expect("embedded asset is valid")
+}
+
+/// Linear progress towards 0 or 1 over a fixed duration; eased when drawn.
+struct Anim {
+    value: f32,
+    duration: f32,
+}
+
+impl Anim {
+    fn new(duration: f32) -> Self {
+        Self { value: 0.0, duration }
     }
 
-    fn is_playing(&self) -> bool {
-        self.player.as_ref().is_some_and(|p| !p.empty())
+    fn step(&mut self, on: bool, dt: f32) {
+        let delta = dt / self.duration;
+        self.value = if on { (self.value + delta).min(1.0) } else { (self.value - delta).max(0.0) };
     }
+
+    fn settled(&self, on: bool) -> bool {
+        self.value == if on { 1.0 } else { 0.0 }
+    }
+}
+
+struct Gfx {
+    window: Rc<Window>,
+    surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
 }
 
 struct App {
-    closed: egui::TextureHandle,
-    open: egui::TextureHandle,
-    audio: Option<Audio>,
-    was_pressed: bool,
+    gfx: Option<Gfx>,
+    scene: Scene,
+    audio: Option<audio::Player>,
+    cursor: Option<PhysicalPosition<f64>>,
+    pressed: bool,
+    press: Anim,
+    active: Anim,
+    started: Instant,
+    last_frame: Instant,
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let load = |name, bytes| {
-            cc.egui_ctx.load_texture(
-                name,
-                to_color_image(&decode_png(bytes)),
-                egui::TextureOptions::LINEAR,
-            )
-        };
+    fn new() -> Self {
+        let now = Instant::now();
         Self {
-            closed: load("closed", CLOSED_PNG),
-            open: load("open", OPEN_PNG),
-            audio: Audio::open(),
-            was_pressed: false,
+            gfx: None,
+            scene: Scene::new(
+                Image::from_filtered_rgb(&inflate(assets::CLOSED), assets::IMAGE_SIZE),
+                Image::from_filtered_rgb(&inflate(assets::OPEN), assets::IMAGE_SIZE),
+                inflate(assets::GLYPH_MASKS),
+            ),
+            audio: None,
+            cursor: None,
+            pressed: false,
+            press: Anim::new(0.08),
+            active: Anim::new(0.25),
+            started: now,
+            last_frame: now,
         }
     }
-}
 
-/// Draws the title centred at `center`. While `activity` (0..=1) is above zero
-/// the letters hop in a wave and the text grows and brightens.
-fn paint_title(painter: &egui::Painter, center: egui::Pos2, font_size: f32, time: f32, activity: f32) {
-    let ease = activity * activity * (3.0 - 2.0 * activity);
-    let size = font_size * (1.0 + 0.12 * ease);
-    let font = egui::FontId::proportional(size);
-    let idle = egui::Color32::from_rgb(0x8d, 0x99, 0xae);
-    let lit = egui::Color32::from_rgb(0xff, 0xd1, 0x66);
-    let color = idle.lerp_to_gamma(lit, ease);
+    fn playing(&self) -> bool {
+        self.audio.as_ref().is_some_and(audio::Player::is_playing)
+    }
 
-    let glyphs: Vec<_> = TITLE
-        .chars()
-        .map(|c| painter.layout_no_wrap(c.to_string(), font.clone(), color))
-        .collect();
-    let spacing = size * 0.04;
-    let total: f32 = glyphs.iter().map(|g| g.size().x + spacing).sum::<f32>() - spacing;
+    fn mouth_open(&self) -> bool {
+        self.pressed || self.playing()
+    }
 
-    let mut x = center.x - total / 2.0;
-    for (i, galley) in glyphs.into_iter().enumerate() {
-        let phase = time * 9.0 - i as f32 * 0.7;
-        let hop = phase.sin().max(0.0) * size * 0.35 * ease;
-        let pos = egui::pos2(x, center.y - galley.size().y / 2.0 - hop);
-        x += galley.size().x + spacing;
-        painter.galley(pos, galley, color);
+    fn animating(&self) -> bool {
+        let open = self.mouth_open();
+        open || !self.press.settled(self.pressed) || !self.active.settled(open)
+    }
+
+    fn layout(&self) -> Option<Layout> {
+        let size = self.gfx.as_ref()?.window.inner_size();
+        Some(Layout::new(size.width as f32, size.height as f32))
+    }
+
+    fn over_button(&self) -> bool {
+        match (self.cursor, self.layout()) {
+            (Some(p), Some(layout)) => layout.button_contains(p.x as f32, p.y as f32),
+            _ => false,
+        }
+    }
+
+    fn on_press(&mut self) {
+        self.pressed = true;
+        if self.audio.is_none() {
+            self.audio = audio::Player::open();
+        }
+        if let Some(audio) = &self.audio {
+            audio.restart();
+        }
+    }
+
+    fn redraw(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
+        let open = self.mouth_open();
+        self.press.step(self.pressed, dt);
+        self.active.step(open, dt);
+
+        if !self.playing() {
+            if let Some(audio) = &self.audio {
+                audio.idle();
+            }
+        }
+
+        let Some(gfx) = &mut self.gfx else { return };
+        let size = gfx.window.inner_size();
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            return;
+        };
+        gfx.surface.resize(w, h).expect("resize surface");
+        let mut buffer = gfx.surface.buffer_mut().expect("surface buffer");
+        self.scene.draw(
+            &mut buffer,
+            Layout::new(size.width as f32, size.height as f32),
+            open,
+            self.press.value,
+            self.active.value,
+            now.duration_since(self.started).as_secs_f32(),
+        );
+        gfx.window.pre_present_notify();
+        buffer.present().expect("present");
     }
 }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(egui::Color32::from_rgb(0x2b, 0x2d, 0x42)))
-            .show(ui, |ui| {
-                let area = ui.max_rect();
-                // Button and title together are about 1.2 button-heights tall.
-                let side = (area.width() * BUTTON_FRACTION)
-                    .min(area.height() * BUTTON_FRACTION / 1.2);
-                let font_size = side * 0.12;
-                let rect = egui::Rect::from_center_size(
-                    area.center() - egui::vec2(0.0, font_size * 0.8),
-                    egui::Vec2::splat(side),
-                );
-                let response = ui
-                    .interact(rect, ui.scope_id().with("popue"), egui::Sense::click_and_drag())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gfx.is_some() {
+            return;
+        }
+        let icon = Icon::from_rgba(inflate(assets::ICON), assets::ICON_SIZE, assets::ICON_SIZE).ok();
+        let attrs = Window::default_attributes()
+            .with_title("Popue")
+            .with_inner_size(LogicalSize::new(WINDOW_SIZE, WINDOW_SIZE))
+            .with_min_inner_size(LogicalSize::new(MIN_WINDOW_SIZE, MIN_WINDOW_SIZE))
+            .with_window_icon(icon);
+        #[cfg(target_os = "linux")]
+        let attrs = {
+            use winit::platform::wayland::WindowAttributesExtWayland as _;
+            attrs.with_name("popue-button", "popue-button")
+        };
+        let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
+        let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
+        let surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
+        window.request_redraw();
+        self.gfx = Some(Gfx { window, surface });
+    }
 
-                let pressed = response.is_pointer_button_down_on();
-                if pressed && !self.was_pressed {
-                    if let Some(audio) = &mut self.audio {
-                        audio.restart();
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached { .. } = cause {
+            if let Some(gfx) = &self.gfx {
+                gfx.window.request_redraw();
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(gfx) = &self.gfx {
+                    gfx.window.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Some(position);
+                if let Some(gfx) = &self.gfx {
+                    let icon = if self.over_button() { CursorIcon::Pointer } else { CursorIcon::Default };
+                    gfx.window.set_cursor(icon);
+                }
+            }
+            WindowEvent::CursorLeft { .. } => self.cursor = None,
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
+                ElementState::Pressed if self.over_button() => {
+                    self.on_press();
+                    self.last_frame = Instant::now();
+                    if let Some(gfx) = &self.gfx {
+                        gfx.window.request_redraw();
                     }
                 }
-                self.was_pressed = pressed;
+                // Releasing anywhere ends the press, like a normal button.
+                ElementState::Released => self.pressed = false,
+                _ => {}
+            },
+            _ => {}
+        }
+    }
 
-                let playing = self.audio.as_ref().is_some_and(Audio::is_playing);
-                let active = pressed || playing;
-                let texture = if active { &self.open } else { &self.closed };
-
-                let ctx = ui.ctx().clone();
-                let press_t = ctx.animate_bool_with_time(response.id.with("press"), pressed, 0.08);
-                let active_t = ctx.animate_bool_with_time(response.id.with("active"), active, 0.25);
-
-                // Slight shrink while held, so it feels like a button.
-                let draw_rect = rect.shrink(rect.width() * 0.03 * press_t);
-                egui::Image::new(texture)
-                    .corner_radius(rect.width() * 0.075)
-                    .paint_at(ui, draw_rect);
-
-                paint_title(
-                    ui.painter(),
-                    egui::pos2(rect.center().x, rect.bottom() + font_size * 1.1),
-                    font_size,
-                    ui.input(|i| i.time) as f32,
-                    active_t,
-                );
-
-                if playing || active_t > 0.0 {
-                    // Keep repainting while the title moves and so the mouth
-                    // closes as soon as the sound ends.
-                    ctx.request_repaint();
-                }
-            });
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Sleep until the next input event unless something is moving.
+        event_loop.set_control_flow(if self.animating() {
+            ControlFlow::WaitUntil(self.last_frame + FRAME)
+        } else {
+            ControlFlow::Wait
+        });
     }
 }
 
-fn main() -> eframe::Result {
-    let icon = decode_png(CLOSED_PNG);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Popue")
-            .with_app_id("popue-button")
-            .with_inner_size([WINDOW_SIZE, WINDOW_SIZE])
-            .with_min_inner_size([MIN_WINDOW_SIZE, MIN_WINDOW_SIZE])
-            .with_icon(egui::IconData {
-                width: icon.width(),
-                height: icon.height(),
-                rgba: icon.into_raw(),
-            }),
-        ..Default::default()
-    };
-    eframe::run_native("Popue", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+fn main() {
+    let event_loop = EventLoop::new().expect("event loop");
+    let mut app = App::new();
+    event_loop.run_app(&mut app).expect("run app");
 }
 
 #[cfg(test)]
@@ -196,11 +259,25 @@ mod tests {
 
     #[test]
     fn embedded_assets_decode() {
-        let closed = decode_png(CLOSED_PNG);
-        let open = decode_png(OPEN_PNG);
-        assert_eq!(closed.dimensions(), open.dimensions());
+        for data in [assets::CLOSED, assets::OPEN] {
+            assert_eq!(inflate(data).len(), assets::IMAGE_SIZE * assets::IMAGE_SIZE * 3);
+        }
+        let icon = assets::ICON_SIZE as usize;
+        assert_eq!(inflate(assets::ICON).len(), icon * icon * 4);
+        assert_eq!(inflate(assets::SOUND).len(), assets::SOUND_SAMPLES * 2);
+        let glyphs = inflate(assets::GLYPH_MASKS);
+        let last = assets::GLYPHS.last().unwrap();
+        assert_eq!(glyphs.len(), last.offset + last.width * last.height);
+    }
 
-        let sound = rodio::Decoder::new(Cursor::new(SOUND_MP3)).expect("mp3 decodes");
-        assert!(sound.count() > 0);
+    #[test]
+    fn draws_into_frame() {
+        let mut app = App::new();
+        let mut frame = vec![0; 300 * 300];
+        let layout = Layout::new(300.0, 300.0);
+        app.scene.draw(&mut frame, layout, true, 1.0, 1.0, 0.3);
+        assert!(layout.button_contains(150.0, 120.0));
+        assert!(!layout.button_contains(5.0, 5.0));
+        assert!(frame.iter().any(|&p| p != frame[0]));
     }
 }

@@ -3,12 +3,29 @@ name = "popue-button"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-eframe = "0.37.0"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
-rodio = { version = "0.23.0", default-features = false, features = ["playback", "mp3"] }
-
 [profile.release]
+opt-level = "z"
 lto = true
 codegen-units = 1
+panic = "abort"
 strip = true
+
+# Build scripts and their deps run on the build machine: keep them fast.
+[profile.release.build-override]
+opt-level = 2
+
+[dependencies]
+cpal = "0.18.2"
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+winit = { version = "0.30.13", default-features = false, features = ["x11", "wayland", "wayland-dlopen", "rwh_06"] }
+
+[build-dependencies]
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+miniz_oxide = { version = "0.9.1", default-features = false, features = ["with-alloc"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["mp3"] }
+
+[target.'cfg(windows)'.build-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "ico"] }
+winresource = "0.1"
